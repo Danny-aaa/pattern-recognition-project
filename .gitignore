@@ -1,0 +1,16 @@
+# 程式產生的大型資料檔，執行對應的程式即可重新產生
+data/*.mat
+results/scatter_eigenvectors.mat
+
+# 課程講義、專題說明文件與每週進度照片（不上傳）
+課程資訊＿每週進度/
+
+# macOS 與 MATLAB 的暫存檔
+.DS_Store
+*.asv
+*.m~
+*.mlx.autosave
+slprj/
+
+# Claude Code 的本機設定
+.claude/
