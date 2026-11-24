@@ -5,6 +5,11 @@
 %   p 的上限是 n - c = n - 2，超過後類內散佈矩陣 S_W 會變成奇異。
 %   對每一個 p 記錄準確率、ROC 與 AUC，畫出 AUC（與準確率）對 p 的曲線，
 %   並用數值驗證 S_W^-1 S_B 只有一個非零特徵值。
+%   Fisher 方向預設用 Ledoit-Wolf 收縮後的 S_W 計算（見 fit_fisher）。
+%   貝氏分類器預設用內層交叉驗證得到的折外 LDA 特徵訓練（見
+%   lda_out_of_fold），不用被 Fisher 方向看過的訓練投影，避免低估變異數。
+%   另外記錄測試折投影與貝氏分類器訓練資料的類內變異數比值（比值遠大於 1
+%   表示貝氏分類器低估了變異數，接近 1 表示估得準）。
 %   輸出 results/lda_dimension_results.mat、lda_dimension_auc.png、
 %   lda_dimension_roc.png。
 %   參考文獻：P. N. Belhumeur, J. P. Hespanha, and D. J. Kriegman,
@@ -18,9 +23,23 @@ function [summary, details] = lda_dimension_experiment(datasetFile, options)
 %   has c - 1 = 1 dimension for two classes, so the dimension that is
 %   varied is the PCA dimension p used before LDA (OPTIONS.dims). SUMMARY
 %   is a table with one row per p: accuracy (mean and std over folds), AUC
-%   (mean and std over folds, and of the pooled out-of-fold scores), and
-%   the training accuracy. DETAILS holds the per-fold values, the
-%   out-of-fold scores, the rank check of S_B, and the options.
+%   (mean and std over folds, and of the pooled out-of-fold scores), the
+%   training accuracy, and the variance ratio described below. DETAILS
+%   holds the per-fold values, the out-of-fold scores, the rank check of
+%   S_B, and the options.
+%
+%   The Fisher direction over-separates the training samples it was fitted
+%   on, so a Bayes classifier fitted on those projections underestimates
+%   the class variances. With OPTIONS.innerFolds > 1 the training folds
+%   are split again by person and the Bayes classifier is fitted on the
+%   out-of-fold LDA features of LDA_OUT_OF_FOLD instead; the test fold is
+%   projected with the Fisher direction of all training folds.
+%   VarianceRatio is the pooled within-class variance of the LDA feature on
+%   the test fold divided by that of the data the Bayes classifier was
+%   fitted on. A ratio far above 1 means the variances are underestimated
+%   and the decision threshold is too narrow; about 1 means they match.
+%   DETAILS.varianceRatioInSample always divides by the in-sample
+%   training projections.
 %
 %   In each fold PCA is fitted once on the training folds; the first p
 %   columns of the projection are the p-dimensional PCA features, in which
@@ -30,7 +49,16 @@ function [summary, details] = lda_dimension_experiment(datasetFile, options)
 %     dims             []      PCA dimensions to test; default 1:(n_train - 2)
 %     covarianceTypes  {'full', 'shared'}  Bayes covariance cases compared
 %                              (see FIT_BAYES)
-%     regularization   1e-6    Bayes covariance regularization
+%     fisherShrinkage  'ledoit-wolf'  S_W estimate of FIT_FISHER ('none' is
+%                              the textbook S_W^-1)
+%     innerFolds       5       inner person-grouped folds for the
+%                              out-of-fold Bayes training features; 0 or 1
+%                              fits the Bayes classifier on the in-sample
+%                              projections (the old behavior). Without
+%                              shrinkage, p must stay below n_inner - 2.
+%     regularization   'ledoit-wolf'  Bayes covariance estimate (see
+%                              FIT_BAYES; for the 1-D LDA feature both
+%                              choices are practically the plain variance)
 %     numFolds         5
 %     seed             1       fold assignment seed
 %     rocDims          [1 5 20 50 100 150]  dimensions shown in the ROC figure
@@ -47,21 +75,15 @@ if nargin < 2
     options = struct();
 end
 defaults = struct('dims', [], 'covarianceTypes', {{'full', 'shared'}}, ...
-    'regularization', 1e-6, 'numFolds', 5, 'seed', 1, ...
+    'fisherShrinkage', 'ledoit-wolf', 'innerFolds', 5, ...
+    'regularization', 'ledoit-wolf', 'numFolds', 5, 'seed', 1, ...
     'rocDims', [1, 5, 20, 50, 100, 150], ...
     'plotFile', fullfile(paths.results, 'lda_dimension_auc.png'), ...
     'rocPlotFile', fullfile(paths.results, 'lda_dimension_roc.png'), ...
     'resultFile', fullfile(paths.results, 'lda_dimension_results.mat'), ...
     'verbose', true);
-names = fieldnames(defaults);
-for i = 1:numel(names)
-    if ~isfield(options, names{i})
-        options.(names{i}) = defaults.(names{i});
-    end
-end
-if ischar(options.covarianceTypes) || isstring(options.covarianceTypes)
-    options.covarianceTypes = cellstr(options.covarianceTypes);
-end
+options = merge_options(options, defaults);
+options.covarianceTypes = validate_covariance_types(options.covarianceTypes);
 
 if ~isfile(datasetFile)
     error('Training-vector file not found: %s', datasetFile);
@@ -69,8 +91,10 @@ end
 data = load(datasetFile, 'X', 'y', 'fileNames');
 X = data.X;
 y = data.y(:);
-foldId = make_person_folds(data.fileNames, y, options.numFolds, options.seed);
+fileNames = data.fileNames(:);
+foldId = make_person_folds(fileNames, y, options.numFolds, options.seed);
 clear data
+useInnerFolds = options.innerFolds > 1;
 
 numFolds = options.numFolds;
 numClasses = 2;
@@ -95,6 +119,9 @@ trainAccuracy = zeros(numFolds, numDims, numTypes);
 auc = zeros(numFolds, numDims, numTypes);
 scores = zeros(numel(y), numDims, numTypes);
 fisherCriterion = zeros(numFolds, numDims);
+fisherShrinkage = zeros(numFolds, numDims);
+varianceRatio = zeros(numFolds, numDims);
+varianceRatioInSample = zeros(numFolds, numDims);
 rankSb = zeros(numFolds, numDims);
 numDiscriminants = zeros(numFolds, numDims);
 
@@ -104,18 +131,37 @@ for k = 1:numFolds
     yte = y(isTest);
 
     tic;
-    pcaModel = fit_pca(X(~isTest, :), max(dims));
-    Atr = project_features(pcaModel, X(~isTest, :));
+    [pcaModel, Atr] = fit_pca(X(~isTest, :), max(dims));
     Ate = project_features(pcaModel, X(isTest, :));
     pcaTime = toc;
     clear pcaModel
 
+    % Out-of-fold LDA features of the training folds for the Bayes fit.
+    tic;
+    if useInnerFolds
+        innerFoldId = make_person_folds(fileNames(~isTest), ytr, ...
+            options.innerFolds, options.seed);
+        zOutOfFold = lda_out_of_fold(Atr, ytr, innerFoldId, dims, ...
+            options.fisherShrinkage);
+    end
+    innerTime = toc;
+
     for j = 1:numDims
         p = dims(j);
-        fisher = fit_fisher(Atr(:, 1:p), ytr);
+        fisher = fit_fisher(Atr(:, 1:p), ytr, options.fisherShrinkage);
         ztr = Atr(:, 1:p) * fisher.w;
         zte = Ate(:, 1:p) * fisher.w;
+        if useInnerFolds
+            zBayes = zOutOfFold(:, j);
+        else
+            zBayes = ztr;
+        end
         fisherCriterion(k, j) = fisher.fisherCriterion;
+        fisherShrinkage(k, j) = fisher.shrinkage;
+        varianceRatio(k, j) = withinClassVariance(zte, yte) ...
+            / withinClassVariance(zBayes, ytr);
+        varianceRatioInSample(k, j) = withinClassVariance(zte, yte) ...
+            / withinClassVariance(ztr, ytr);
 
         % LDA dimension limit: S_W^-1 S_B has rank(S_B) <= c - 1 nonzero
         % eigenvalues, so only one discriminant direction exists.
@@ -128,7 +174,7 @@ for k = 1:numFolds
         end
 
         for t = 1:numTypes
-            classifier = fit_bayes(ztr, ytr, types{t}, options.regularization);
+            classifier = fit_bayes(zBayes, ytr, types{t}, options.regularization);
             [yPred, score] = predict_bayes(classifier, zte);
             scores(isTest, j, t) = score;
             accuracy(k, j, t) = mean(yPred == yte);
@@ -137,8 +183,9 @@ for k = 1:numFolds
         end
     end
     if options.verbose
-        fprintf('Fold %d/%d done (PCA %.1f s, %d dimensions x %d covariance types)\n', ...
-            k, numFolds, pcaTime, numDims, numTypes);
+        fprintf(['Fold %d/%d done (PCA %.1f s, inner CV %.1f s, ' ...
+            '%d dimensions x %d covariance types)\n'], ...
+            k, numFolds, pcaTime, innerTime, numDims, numTypes);
     end
 end
 
@@ -158,9 +205,10 @@ for t = 1:numTypes
         mean(accuracy(:, :, t), 1).', std(accuracy(:, :, t), 0, 1).', ...
         mean(auc(:, :, t), 1).', std(auc(:, :, t), 0, 1).', ...
         aucPooled(:, t), mean(trainAccuracy(:, :, t), 1).', ...
+        mean(varianceRatio, 1).', mean(fisherShrinkage, 1).', ...
         'VariableNames', {'Covariance', 'PcaDim', 'LdaDim', ...
         'AccuracyMean', 'AccuracyStd', 'AUCMean', 'AUCStd', 'AUCPooled', ...
-        'TrainAccuracyMean'});
+        'TrainAccuracyMean', 'VarianceRatio', 'FisherShrinkage'});
     summary = [summary; part]; %#ok<AGROW>
 end
 
@@ -168,12 +216,15 @@ details = struct('options', options, 'dims', dims, ...
     'covarianceTypes', {types}, 'foldId', foldId, 'accuracy', accuracy, ...
     'trainAccuracy', trainAccuracy, 'auc', auc, 'aucPooled', aucPooled, ...
     'scores', scores, 'y', y, 'fisherCriterion', fisherCriterion, ...
+    'fisherShrinkage', fisherShrinkage, 'varianceRatio', varianceRatio, ...
+    'varianceRatioInSample', varianceRatioInSample, ...
     'rankSb', rankSb, 'numDiscriminants', numDiscriminants, ...
     'ldaDimensionLimit', numClasses - 1, 'maxPcaDim', maxDim);
 
 if options.verbose
-    fprintf('LDA dimension upper bound c - 1 = %d; rank(S_B) = %d in every fold and p: %d\n', ...
-        numClasses - 1, numClasses - 1, all(rankSb == numClasses - 1, 'all'));
+    fprintf(['LDA dimension upper bound c - 1 = %d; rank(S_B) over all ' ...
+        'folds and p: min %d, max %d\n'], numClasses - 1, ...
+        min(rankSb, [], 'all'), max(rankSb, [], 'all'));
     fprintf('Nonzero eigenvalues of S_W^-1 S_B: min %d, max %d\n', ...
         min(numDiscriminants, [], 'all'), max(numDiscriminants, [], 'all'));
     for t = 1:numTypes
@@ -181,95 +232,44 @@ if options.verbose
         meanAcc = mean(accuracy(:, :, t), 1);
         [bestAuc, iAuc] = max(meanAuc);
         [bestAcc, iAcc] = max(meanAcc);
+        [worstAcc, iWorst] = min(meanAcc);
         fprintf(['%-6s covariance: best mean AUC = %.4f at p = %d, ' ...
-            'best mean accuracy = %.3f at p = %d\n'], types{t}, bestAuc, ...
-            dims(iAuc), bestAcc, dims(iAcc));
+            'best mean accuracy = %.3f at p = %d, worst = %.3f at p = %d\n'], ...
+            types{t}, bestAuc, dims(iAuc), bestAcc, dims(iAcc), ...
+            worstAcc, dims(iWorst));
     end
 end
 
 if ~isempty(options.resultFile)
     save(options.resultFile, 'summary', 'details', '-v7');
 end
+seriesNames = cellfun(@(t) covariance_label(t, 1), types, ...
+    'UniformOutput', false);
+labels = struct('methodName', 'LDA + Bayes', 'dimSymbol', 'p', ...
+    'dimAxisLabel', 'PCA dimension p before LDA (LDA output: 1 dimension)');
 if ~isempty(options.plotFile)
-    plotDimensionCurves(dims, accuracy, auc, types, numFolds, options.plotFile);
+    plot_dimension_curves(dims, accuracy, auc, seriesNames, numFolds, ...
+        options.plotFile, labels);
 end
 if ~isempty(options.rocPlotFile)
-    plotRocCurves(dims, scores, y, types, options.rocDims, numFolds, ...
-        options.rocPlotFile);
+    plot_roc_curves(dims, scores, y, seriesNames, options.rocDims, ...
+        numFolds, options.rocPlotFile, labels);
 end
 if options.verbose
-    fprintf('Saved results to %s\n', paths.results);
-end
-end
-
-function plotDimensionCurves(dims, accuracy, auc, types, numFolds, fileName)
-% AUC and accuracy against the PCA dimension p used before LDA.
-fig = figure('Visible', 'off', 'Position', [0, 0, 1100, 420]);
-if exist('theme', 'file')
-    theme(fig, 'light');
-end
-layout = tiledlayout(fig, 1, 2, 'TileSpacing', 'compact', 'Padding', 'compact');
-values = {auc, accuracy};
-labels = {'AUC', 'Accuracy'};
-for q = 1:2
-    nexttile(layout);
-    hold on;
-    for t = 1:numel(types)
-        plot(dims, mean(values{q}(:, :, t), 1), 'LineWidth', 1.5, ...
-            'DisplayName', covarianceLabel(types{t}));
+    saved = {options.resultFile, options.plotFile, options.rocPlotFile};
+    saved = saved(~cellfun(@isempty, saved));
+    if ~isempty(saved)
+        fprintf('Saved %s\n', strjoin(saved, ', '));
     end
-    hold off;
-    xlabel('PCA dimension p before LDA (LDA output: 1 dimension)');
-    ylabel(sprintf('%s (mean of %d folds)', labels{q}, numFolds));
-    title(sprintf('LDA + Bayes: %s vs. dimension', labels{q}));
-    xlim([min(dims), max(dims)]);
-    % Zoom in on the range the curves actually cover.
-    lowest = min(mean(values{q}, 1), [], 'all');
-    ylim([min(0.9, floor(lowest * 20) / 20), 1.005]);
-    legend('Location', 'southwest');
-    grid on;
 end
-exportgraphics(fig, fileName, 'Resolution', 150);
-close(fig);
 end
 
-function plotRocCurves(dims, scores, y, types, rocDims, numFolds, fileName)
-% Pooled out-of-fold ROC curves for a few PCA dimensions.
-rocDims = intersect(rocDims, dims);
-if isempty(rocDims)
-    return;
+function v = withinClassVariance(z, y)
+% Pooled within-class variance of a 1-D feature: sum_i sum (z - c_i)^2 / n.
+v = 0;
+for label = [0, 1]
+    zi = z(y == label);
+    v = v + sum((zi - mean(zi)) .^ 2);
 end
-fig = figure('Visible', 'off', 'Position', [0, 0, 520 * numel(types), 480]);
-if exist('theme', 'file')
-    theme(fig, 'light');
-end
-layout = tiledlayout(fig, 1, numel(types), 'TileSpacing', 'compact', ...
-    'Padding', 'compact');
-for t = 1:numel(types)
-    nexttile(layout);
-    hold on;
-    for p = rocDims
-        [falseAlarm, hit, areaUnder] = roc_auc(scores(:, dims == p, t), y);
-        plot(falseAlarm, hit, 'LineWidth', 1.3, 'DisplayName', ...
-            sprintf('p = %d (AUC = %.4f)', p, areaUnder));
-    end
-    plot([0, 1], [0, 1], 'k:', 'HandleVisibility', 'off');
-    hold off;
-    axis square;
-    xlabel('False alarm rate P(score > x^* | man)');
-    ylabel('Hit rate P(score > x^* | woman)');
-    title(sprintf('%d-fold ROC, LDA + %s', numFolds, covarianceLabel(types{t})));
-    legend('Location', 'southeast');
-    grid on;
-end
-exportgraphics(fig, fileName, 'Resolution', 150);
-close(fig);
-end
-
-function label = covarianceLabel(covarianceType)
-if strcmp(covarianceType, 'full')
-    label = 'Bayes, \sigma_i^2 separate';
-else
-    label = 'Bayes, \sigma^2 shared';
-end
+v = v / numel(z);
 end

@@ -3,13 +3,21 @@
 %   Xc * Xc' 的特徵值問題，再換算回 S 的特徵向量（Turk & Pentland 的
 %   eigenfaces 作法）。資料置中後最多只有 n - 1 個非零特徵值，所以 PCA 的
 %   維度上限是 n - 1。可用個數或解釋變異比例指定要保留的維度。
+%   第二個輸出直接給出訓練資料的 PCA 特徵 V * sqrt(lambda)，等於
+%   (X - m) * E，但不必再對 120 萬維的資料做一次投影。
 
-function model = fit_pca(X, numComponents)
+function [model, Atrain] = fit_pca(X, numComponents)
 %FIT_PCA Fit principal component analysis to the rows of X.
 %   MODEL = FIT_PCA(X, NUMCOMPONENTS) treats each row of X (n-by-d) as one
 %   sample and returns the d'-dimensional PCA subspace of the training
 %   data. Project new samples with PROJECT_FEATURES(MODEL, Xnew), which
 %   computes the principal components a = E' * (x - m).
+%
+%   [MODEL, ATRAIN] = FIT_PCA(...) also returns the n-by-d' principal
+%   components of the training samples themselves. Since
+%   Xc * E = Xc * Xc' * V / sqrt(lambda) = V * sqrt(lambda), they come from
+%   the n-by-n eigenproblem directly, in double precision, and equal
+%   PROJECT_FEATURES(MODEL, X) without a second pass over the pixels.
 %
 %   NUMCOMPONENTS selects d':
 %     integer >= 1    keep that many components (capped at rank n - 1)
@@ -68,6 +76,9 @@ else
 end
 
 E = (Xc.' * V(:, 1:k)) ./ sqrt(lambda(1:k)).';
+if nargout > 1
+    Atrain = V(:, 1:k) .* sqrt(lambda(1:k)).';
+end
 
 model = struct( ...
     'method', 'PCA', ...

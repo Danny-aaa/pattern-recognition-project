@@ -3,6 +3,8 @@
 %   記錄準確率、ROC 與 AUC，畫出 AUC（與準確率）對 d' 的曲線。
 %   每一折只做一次 PCA（取到上限 n - 1 維），前 d' 個主成分就是 d' 維的
 %   PCA 特徵，所以不必對每個 d' 重新計算特徵向量。
+%   貝氏分類器的共變異數預設用 Ledoit-Wolf 收縮估計（見 fit_bayes），
+%   d' 接近或超過每類訓練樣本數（約 80）時才不會因矩陣奇異而失準。
 %   輸出 results/pca_dimension_results.mat、pca_dimension_auc.png、
 %   pca_dimension_roc.png。
 
@@ -12,8 +14,9 @@ function [summary, details] = pca_dimension_experiment(datasetFile, options)
 %   person-grouped K-fold cross-validation of PCA + Bayes for every PCA
 %   dimension in OPTIONS.dims. SUMMARY is a table with one row per d':
 %   accuracy (mean and std over folds), AUC (mean and std over folds, and
-%   of the pooled out-of-fold scores). DETAILS holds the per-fold values,
-%   the out-of-fold scores, and the options.
+%   of the pooled out-of-fold scores), and the mean Ledoit-Wolf shrinkage
+%   of the Bayes covariances. DETAILS holds the per-fold values, the
+%   out-of-fold scores, and the options.
 %
 %   In each fold PCA is fitted once on the training folds with all n - 1
 %   components. The eigenvectors are sorted by eigenvalue, so the first d'
@@ -23,7 +26,9 @@ function [summary, details] = pca_dimension_experiment(datasetFile, options)
 %     dims             []      PCA dimensions to test; default 1:(n_train - 1)
 %     covarianceTypes  {'full', 'shared'}  Bayes covariance cases compared
 %                              (see FIT_BAYES)
-%     regularization   1e-6    Bayes covariance regularization
+%     regularization   'ledoit-wolf'  Bayes covariance estimate (see
+%                              FIT_BAYES); a scalar such as 1e-6 gives the
+%                              old fixed ridge
 %     numFolds         5
 %     seed             1       fold assignment seed
 %     rocDims          [1 5 10 20 50 100]  dimensions shown in the ROC figure
@@ -40,21 +45,14 @@ if nargin < 2
     options = struct();
 end
 defaults = struct('dims', [], 'covarianceTypes', {{'full', 'shared'}}, ...
-    'regularization', 1e-6, 'numFolds', 5, 'seed', 1, ...
+    'regularization', 'ledoit-wolf', 'numFolds', 5, 'seed', 1, ...
     'rocDims', [1, 5, 10, 20, 50, 100], ...
     'plotFile', fullfile(paths.results, 'pca_dimension_auc.png'), ...
     'rocPlotFile', fullfile(paths.results, 'pca_dimension_roc.png'), ...
     'resultFile', fullfile(paths.results, 'pca_dimension_results.mat'), ...
     'verbose', true);
-names = fieldnames(defaults);
-for i = 1:numel(names)
-    if ~isfield(options, names{i})
-        options.(names{i}) = defaults.(names{i});
-    end
-end
-if ischar(options.covarianceTypes) || isstring(options.covarianceTypes)
-    options.covarianceTypes = cellstr(options.covarianceTypes);
-end
+options = merge_options(options, defaults);
+options.covarianceTypes = validate_covariance_types(options.covarianceTypes);
 
 if ~isfile(datasetFile)
     error('Training-vector file not found: %s', datasetFile);
@@ -84,6 +82,7 @@ numDims = numel(dims);
 numTypes = numel(types);
 accuracy = zeros(numFolds, numDims, numTypes);
 auc = zeros(numFolds, numDims, numTypes);
+shrinkage = nan(numFolds, numDims, numTypes);
 scores = zeros(numel(y), numDims, numTypes);
 
 for k = 1:numFolds
@@ -92,8 +91,7 @@ for k = 1:numFolds
     yte = y(isTest);
 
     tic;
-    pcaModel = fit_pca(X(~isTest, :), max(dims));
-    Atr = project_features(pcaModel, X(~isTest, :));
+    [pcaModel, Atr] = fit_pca(X(~isTest, :), max(dims));
     Ate = project_features(pcaModel, X(isTest, :));
     pcaTime = toc;
     clear pcaModel
@@ -106,6 +104,7 @@ for k = 1:numFolds
             [yPred, score] = predict_bayes(classifier, Ate(:, 1:d));
             scores(isTest, j, t) = score;
             accuracy(k, j, t) = mean(yPred == yte);
+            shrinkage(k, j, t) = mean(classifier.shrinkage);
             [~, ~, auc(k, j, t)] = roc_auc(score, yte);
         end
     end
@@ -129,16 +128,16 @@ for t = 1:numTypes
         repmat(string(types{t}), numDims, 1), dims.', ...
         mean(accuracy(:, :, t), 1).', std(accuracy(:, :, t), 0, 1).', ...
         mean(auc(:, :, t), 1).', std(auc(:, :, t), 0, 1).', ...
-        aucPooled(:, t), ...
+        aucPooled(:, t), mean(shrinkage(:, :, t), 1).', ...
         'VariableNames', {'Covariance', 'PcaDim', 'AccuracyMean', ...
-        'AccuracyStd', 'AUCMean', 'AUCStd', 'AUCPooled'});
+        'AccuracyStd', 'AUCMean', 'AUCStd', 'AUCPooled', 'ShrinkageMean'});
     summary = [summary; part]; %#ok<AGROW>
 end
 
 details = struct('options', options, 'dims', dims, ...
     'covarianceTypes', {types}, 'foldId', foldId, 'accuracy', accuracy, ...
-    'auc', auc, 'aucPooled', aucPooled, 'scores', scores, 'y', y, ...
-    'maxDim', maxDim);
+    'auc', auc, 'aucPooled', aucPooled, 'shrinkage', shrinkage, ...
+    'scores', scores, 'y', y, 'maxDim', maxDim);
 
 if options.verbose
     for t = 1:numTypes
@@ -146,95 +145,34 @@ if options.verbose
         meanAcc = mean(accuracy(:, :, t), 1);
         [bestAuc, iAuc] = max(meanAuc);
         [bestAcc, iAcc] = max(meanAcc);
+        [worstAcc, iWorst] = min(meanAcc);
         fprintf(['%-6s covariance: best mean AUC = %.4f at d'' = %d, ' ...
-            'best mean accuracy = %.3f at d'' = %d\n'], types{t}, bestAuc, ...
-            dims(iAuc), bestAcc, dims(iAcc));
+            'best mean accuracy = %.3f at d'' = %d, worst = %.3f at d'' = %d\n'], ...
+            types{t}, bestAuc, dims(iAuc), bestAcc, dims(iAcc), ...
+            worstAcc, dims(iWorst));
     end
 end
 
 if ~isempty(options.resultFile)
     save(options.resultFile, 'summary', 'details', '-v7');
 end
+seriesNames = cellfun(@(t) covariance_label(t, 2), types, ...
+    'UniformOutput', false);
+labels = struct('methodName', 'PCA + Bayes', 'dimSymbol', 'd''', ...
+    'dimAxisLabel', 'PCA dimension d''');
 if ~isempty(options.plotFile)
-    plotDimensionCurves(dims, accuracy, auc, types, numFolds, options.plotFile);
+    plot_dimension_curves(dims, accuracy, auc, seriesNames, numFolds, ...
+        options.plotFile, labels);
 end
 if ~isempty(options.rocPlotFile)
-    plotRocCurves(dims, scores, y, types, options.rocDims, numFolds, ...
-        options.rocPlotFile);
+    plot_roc_curves(dims, scores, y, seriesNames, options.rocDims, ...
+        numFolds, options.rocPlotFile, labels);
 end
 if options.verbose
-    fprintf('Saved results to %s\n', paths.results);
-end
-end
-
-function plotDimensionCurves(dims, accuracy, auc, types, numFolds, fileName)
-% AUC and accuracy against the PCA dimension d' (mean over folds).
-fig = figure('Visible', 'off', 'Position', [0, 0, 1100, 420]);
-if exist('theme', 'file')
-    theme(fig, 'light');
-end
-layout = tiledlayout(fig, 1, 2, 'TileSpacing', 'compact', 'Padding', 'compact');
-values = {auc, accuracy};
-labels = {'AUC', 'Accuracy'};
-for p = 1:2
-    nexttile(layout);
-    hold on;
-    for t = 1:numel(types)
-        plot(dims, mean(values{p}(:, :, t), 1), 'LineWidth', 1.5, ...
-            'DisplayName', covarianceLabel(types{t}));
+    saved = {options.resultFile, options.plotFile, options.rocPlotFile};
+    saved = saved(~cellfun(@isempty, saved));
+    if ~isempty(saved)
+        fprintf('Saved %s\n', strjoin(saved, ', '));
     end
-    hold off;
-    xlabel('PCA dimension d''');
-    ylabel(sprintf('%s (mean of %d folds)', labels{p}, numFolds));
-    title(sprintf('PCA + Bayes: %s vs. d''', labels{p}));
-    xlim([min(dims), max(dims)]);
-    % Zoom in on the range the curves actually cover.
-    lowest = min(mean(values{p}, 1), [], 'all');
-    ylim([min(0.9, floor(lowest * 20) / 20), 1.005]);
-    legend('Location', 'southwest');
-    grid on;
-end
-exportgraphics(fig, fileName, 'Resolution', 150);
-close(fig);
-end
-
-function plotRocCurves(dims, scores, y, types, rocDims, numFolds, fileName)
-% Pooled out-of-fold ROC curves for a few PCA dimensions.
-rocDims = intersect(rocDims, dims);
-if isempty(rocDims)
-    return;
-end
-fig = figure('Visible', 'off', 'Position', [0, 0, 520 * numel(types), 480]);
-if exist('theme', 'file')
-    theme(fig, 'light');
-end
-layout = tiledlayout(fig, 1, numel(types), 'TileSpacing', 'compact', ...
-    'Padding', 'compact');
-for t = 1:numel(types)
-    nexttile(layout);
-    hold on;
-    for d = rocDims
-        [falseAlarm, hit, areaUnder] = roc_auc(scores(:, dims == d, t), y);
-        plot(falseAlarm, hit, 'LineWidth', 1.3, 'DisplayName', ...
-            sprintf('d'' = %d (AUC = %.4f)', d, areaUnder));
-    end
-    plot([0, 1], [0, 1], 'k:', 'HandleVisibility', 'off');
-    hold off;
-    axis square;
-    xlabel('False alarm rate P(score > x^* | man)');
-    ylabel('Hit rate P(score > x^* | woman)');
-    title(sprintf('%d-fold ROC, %s', numFolds, covarianceLabel(types{t})));
-    legend('Location', 'southeast');
-    grid on;
-end
-exportgraphics(fig, fileName, 'Resolution', 150);
-close(fig);
-end
-
-function label = covarianceLabel(covarianceType)
-if strcmp(covarianceType, 'full')
-    label = 'Bayes, \Sigma_i arbitrary (quadratic)';
-else
-    label = 'Bayes, \Sigma_i = \Sigma (linear)';
 end
 end
